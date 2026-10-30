@@ -9,6 +9,9 @@
 #define BDSG_BASE_PACKED_GRAPH_HPP_INCLUDED
 
 #include <utility>
+#include <atomic>
+#include <future>
+#include <cstdlib>
 
 #include <handlegraph/util.hpp>
 
@@ -3044,11 +3047,21 @@ void BasePackedGraph<Backend>::reassign_node_ids(const std::function<nid_t(const
         }
     }
     
-    // update the node IDs of steps on paths
-    for (size_t i = 0; i < paths.size(); ++i){
+    // Every path owns its compressed pages. The ID map and graph remain read-only
+    // until all workers join; never write adjacent packed entries from two workers.
+    size_t path_threads = 1;
+    if (const char* value = std::getenv("VG_BENCH_PATH_THREADS")) {
+        std::string text(value);
+        if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos)
+            throw std::invalid_argument("VG_BENCH_PATH_THREADS must be a positive integer");
+        path_threads = std::stoull(text);
+        if (!path_threads) throw std::invalid_argument("VG_BENCH_PATH_THREADS must be positive");
+    }
+    path_threads = std::min(path_threads, std::max<size_t>(1, paths.size()));
+    auto update_path = [&](size_t i) {
         
         if (path_is_deleted_iv.get(i)) {
-            continue;
+            return;
         }
         
         PackedPath& packed_path = paths[i];
@@ -3068,9 +3081,23 @@ void BasePackedGraph<Backend>::reassign_node_ids(const std::function<nid_t(const
                 }
             }
         }
+    };
+    if (path_threads == 1) {
+        for (size_t i = 0; i < paths.size(); ++i) update_path(i);
+    } else {
+        std::atomic<size_t> next_path(0);
+        auto worker = [&]() {
+            for (size_t i = next_path.fetch_add(1); i < paths.size(); i = next_path.fetch_add(1))
+                update_path(i);
+        };
+        std::vector<std::future<void>> workers;
+        for (size_t i = 1; i < path_threads; ++i)
+            workers.emplace_back(std::async(std::launch::async, worker));
+        worker();
+        for (auto& thread : workers) thread.get();
     }
-    
-    // initialize new ID member variables
+
+    // initialize new ID member variables only after the parallel readers join
     nid_t new_max_id = 0;
     nid_t new_min_id = std::numeric_limits<nid_t>::max();
     decltype(nid_to_graph_iv) new_nid_to_graph_iv;
